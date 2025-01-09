@@ -2,7 +2,7 @@ from textual.app import ComposeResult
 from textual.widget import Widget
 from textual.containers import Horizontal, Container, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DirectoryTree, Static, Button, TextArea, Input, Label
+from textual.widgets import DirectoryTree, Static, Button, TextArea, Input, Label, TabbedContent, TabPane
 from textual.binding import Binding
 from ...ui.mixins.focus_mixin import InitialFocusMixin
 from typing import Optional
@@ -94,10 +94,15 @@ class NewFileDialog(ModalScreen):
         try:
             with open(full_path, 'w') as f:
                 f.write("")
-            self.dismiss(full_path)
             self.app.post_message(FileCreated(full_path))
             tree = self.app.query_one(FilterableDirectoryTree)
-            tree.refresh_tree() 
+            tree.refresh_tree()
+            
+            # Find the TabContainer through the NestView
+            nest_view = self.app.query_one("NestView")
+            tab_container = nest_view.query_one(TabContainer)
+            tab_container.open_file(full_path)
+            
             self.dismiss(full_path)
         except Exception as e:
             self.notify(f"Error creating file: {str(e)}", severity="error")
@@ -223,12 +228,11 @@ class CodeEditor(TextArea):
         self.status_bar.update_mode("NORMAL")
         self.cursor_blink = False
 
-    def compose(self) -> ComposeResult:
-        yield self.status_bar
-        
     def on_mount(self) -> None:
+        super().on_mount()  # Make sure to call parent's on_mount
         self.status_bar.update_mode("NORMAL")
         self._update_status_info()
+        self.focus()  # Ensure the editor gets focus when mounted
 
     def _update_status_info(self) -> None:
         file_info = []
@@ -643,6 +647,8 @@ class CodeEditor(TextArea):
         except Exception as e:
             self.notify(f"Error opening file: {str(e)}", severity="error")
 
+            
+
 class NestView(Container, InitialFocusMixin):
     BINDINGS = [
         Binding("ctrl+h", "toggle_hidden", "Toggle Hidden Files", show=True),
@@ -659,8 +665,14 @@ class NestView(Container, InitialFocusMixin):
         self.editor = None
 
     async def action_new_file(self) -> None:
-        editor = self.query_one(CodeEditor)
-        await editor.action_new_file()
+        try:
+            tree = self.query_one(FilterableDirectoryTree)
+            current_path = tree.path if tree.path else os.path.expanduser("~")
+        except Exception:
+            current_path = os.path.expanduser("~")
+            
+        dialog = NewFileDialog(current_path)
+        await self.app.push_screen(dialog)
 
     def on_file_created(self, event: FileCreated) -> None:
         self.notify(f"Created file: {os.path.basename(event.path)}")
@@ -684,7 +696,7 @@ class NestView(Container, InitialFocusMixin):
                     classes="file-nav"
                 ),
                 Container(
-                    CustomCodeEditor(),
+                    TabContainer(),
                     classes="editor-container"
                 ),
                 classes="main-container"
@@ -693,16 +705,13 @@ class NestView(Container, InitialFocusMixin):
         )
 
     def on_mount(self) -> None:
-        self.editor = self.query_one(CodeEditor)
         tree = self.query_one(FilterableDirectoryTree)
         tree.focus()
 
-        self.editor.can_focus_tab = True
-        self.editor.key_handlers = {
-            "ctrl+left": lambda: self.action_focus_tree(),
-            "ctrl+n": self.action_new_file
-        }
+        # Instead of querying for CodeEditor, we'll query for TabContainer
+        tab_container = self.query_one(TabContainer)
         
+        # Set up key handlers for the tree
         tree.key_handlers = {
             "ctrl+n": self.action_new_file
         }
@@ -726,7 +735,12 @@ class NestView(Container, InitialFocusMixin):
             file_nav.remove_class("hidden")
             
     def action_focus_editor(self) -> None:
-        self.query_one(CodeEditor).focus()
+        # Update to focus the active editor in the tab container
+        tab_container = self.query_one(TabContainer)
+        if tab_container.active:
+            active_pane = tab_container.get_pane(tab_container.active)
+            if active_pane:
+                active_pane.query_one(CustomCodeEditor).focus()
 
     def action_focus_tree(self) -> None:
         self.query_one(FilterableDirectoryTree).focus()
@@ -741,7 +755,8 @@ class NestView(Container, InitialFocusMixin):
             self.action_toggle_hidden()
             event.stop()
         elif event.button.id == "new_file":
-            self.run_worker(self.editor.action_new_file())
+            # Fix: Use self.action_new_file instead of self.editor
+            self.run_worker(self.action_new_file())
             event.stop()
         elif event.button.id == "refresh_tree": 
             self.action_refresh_tree()
@@ -760,9 +775,8 @@ class NestView(Container, InitialFocusMixin):
                 event.stop()
                 return
 
-            editor = self.query_one(CodeEditor)
-            editor.open_file(event.path)
-            editor.focus()
+            tab_container = self.query_one(TabContainer)
+            tab_container.open_file(event.path)
             event.stop()
 
         except UnicodeDecodeError:
@@ -783,3 +797,56 @@ class CustomCodeEditor(CodeEditor):
 
     def action_focus_tree(self) -> None:
         self.app.query_one("NestView").action_focus_tree()
+
+class CustomTabPane(TabPane):
+    """Custom TabPane that includes a status bar"""
+    def __init__(self, title: str, editor: CodeEditor) -> None:
+        super().__init__(title)
+        self.editor = editor
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield self.editor
+            yield self.editor.status_bar
+
+class TabContainer(TabbedContent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_files = {}
+        self._tab_counter = 0
+
+    def _make_valid_id(self, filepath: str) -> str:
+        """Generate a valid ID for the tab that's unique and valid."""
+        self._tab_counter += 1
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        # Replace invalid characters with underscores
+        valid_base = "".join(c if c.isalnum() else "_" for c in base)
+        # Ensure it starts with a letter
+        if not valid_base[0].isalpha():
+            valid_base = "f_" + valid_base
+        return f"{valid_base}_{self._tab_counter}"
+
+    def open_file(self, filepath: str) -> None:
+        filepath = str(filepath)
+        
+        if filepath in self.open_files:
+            self.active = self.open_files[filepath].id
+            return
+
+        editor = CustomCodeEditor()
+        editor.open_file(filepath)
+        
+        tab_title = os.path.basename(filepath)
+        new_tab = CustomTabPane(tab_title, editor)
+        new_tab.id = self._make_valid_id(filepath)
+        
+        self.add_pane(new_tab)
+        self.open_files[filepath] = new_tab
+        self.active = new_tab.id
+        editor.focus()
+
+    def close_tab(self, filepath: str) -> None:
+        filepath = str(filepath)
+        if filepath in self.open_files:
+            self.remove_pane(self.open_files[filepath])
+            del self.open_files[filepath]
