@@ -1,4 +1,5 @@
 from textual.app import ComposeResult
+from textual import on
 from textual.widget import Widget
 from textual.containers import Horizontal, Container, Vertical
 from textual.screen import ModalScreen
@@ -12,6 +13,7 @@ from rich.text import Text
 import os
 
 class FileCreated(Message):
+    BUBBLE = True
     def __init__(self, path: str) -> None:
         super().__init__()
         self.path = path
@@ -94,16 +96,14 @@ class NewFileDialog(ModalScreen):
         try:
             with open(full_path, 'w') as f:
                 f.write("")
+            
+            # First dismiss with the path
+            self.dismiss(full_path)
+            
+            # Then post the message and refresh tree
             self.app.post_message(FileCreated(full_path))
             tree = self.app.query_one(FilterableDirectoryTree)
             tree.refresh_tree()
-            
-            # Find the TabContainer through the NestView
-            nest_view = self.app.query_one("NestView")
-            tab_container = nest_view.query_one(TabContainer)
-            tab_container.open_file(full_path)
-            
-            self.dismiss(full_path)
         except Exception as e:
             self.notify(f"Error creating file: {str(e)}", severity="error")
             self.dismiss(None)  
@@ -674,10 +674,18 @@ class NestView(Container, InitialFocusMixin):
         dialog = NewFileDialog(current_path)
         await self.app.push_screen(dialog)
 
+    @on(FileCreated)
     def on_file_created(self, event: FileCreated) -> None:
         self.notify(f"Created file: {os.path.basename(event.path)}")
+        
+        # First refresh the tree
         tree = self.query_one(FilterableDirectoryTree)
         tree.refresh_tree()
+        
+        # Get the tab container and open the file
+        tab_container = self.query_one(TabContainer)
+        tab_container.open_file(event.path)
+
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -696,7 +704,7 @@ class NestView(Container, InitialFocusMixin):
                     classes="file-nav"
                 ),
                 Container(
-                    TabContainer(),
+                    TabContainer(id="tabs"),
                     classes="editor-container"
                 ),
                 classes="main-container"
@@ -810,8 +818,13 @@ class CustomTabPane(TabPane):
             yield self.editor.status_bar
 
 class TabContainer(TabbedContent):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        id: str | None = None,
+        name: str | None = None,
+        classes: str | None = None
+    ) -> None:
+        super().__init__(id=id, name=name, classes=classes)
         self.open_files = {}
         self._tab_counter = 0
 
